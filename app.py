@@ -1,24 +1,27 @@
 import requests
 import json
 import streamlit as st
-import configparser # 설정 파일을 읽기 위해 추가
+import configparser
 import sys
+import urllib.parse # requests 사용 시 필요
 
 # =========================================================
 # I. 설정 및 환경 변수 (CONFIG.INI에서 로드)
 # =========================================================
-
-# 전국 행정구역 데이터 (모든 지역을 하드코딩한 원본 DB 역할)
-# 실제 앱에서는 이 리스트에서 config.ini에 지정된 지역만 필터링됩니다.
+# 전국 행정구역 데이터 (원본 DB 역할) - config.ini에 없는 지역이 들어올 경우 대비
 FULL_ADMIN_DB = {
     "서울특별시": {
-        "강남구": "11680", "서초구": "11650", "송파구": "11710", "영등포구": "11560", "마포구": "11440"
+        "강남구": "11680", "서초구": "11650", "송파구": "11710",
+        "영등포구": "11560", "마포구": "11440"
     },
     "부산광역시": {
         "해운대구": "26350", "부산진구": "26230", "동래구": "26260"
     },
     "인천광역시": {
         "연수구": "28185", "남동구": "28177", "서구": "28260"
+    },
+    "대구광역시": {
+        "수성구": "27260", "달서구": "27290", "중구": "27110"
     },
     "경기도": {
         "성남시 분당구": "41135", "수원시 영통구": "41113", "용인시 수지구": "41465"
@@ -32,11 +35,11 @@ def load_config():
     try:
         config.read('config.ini', encoding='utf-8')
         
-        # 1. 키 및 설정값 로드
+        # 설정값 로드
         v_key = config.get('SETTINGS', 'VWORLD_KEY').strip()
         ratio = float(config.get('APP_DATA', 'MARKET_RATIO'))
         
-        # 2. 허용된 지역 코드 로드 및 정리
+        # 허용된 지역 코드 로드 및 정리
         allowed_codes_str = config.get('LOCATION', 'ALLOWED_CODES')
         allowed_codes = [c.strip() for c in allowed_codes_str.split(',') if c.strip()]
 
@@ -47,31 +50,34 @@ def load_config():
     
     except FileNotFoundError:
         st.error("❌ 오류: 'config.ini' 파일을 찾을 수 없습니다. 앱 폴더에 파일을 생성했는지 확인하세요.")
-        return None, None, None
+        st.stop()
     except Exception as e:
-        st.error(f"❌ 오류: config.ini 파일 내용이 잘못되었습니다. [LOCATION] 섹션 코드를 확인하세요. ({e})")
-        return None, None, None
+        st.error(f"❌ 오류: config.ini 파일 내용이 잘못되었습니다. 포맷 또는 코드를 확인하세요. ({e})")
+        st.stop()
 
 
 # =========================================================
 # II. 모듈 함수 정의 (통합 핵심 로직)
 # =========================================================
 
-# (이하 함수들은 이전 완성본과 동일합니다.) -------------------------------------
-
 def format_korean_money(amount):
     """숫자를 'X억 Y천만 Z만원' 형태로 변환합니다."""
     if amount <= 0:
         return "0 원"
+    
     amount = int(amount)
     eok = amount // 100000000
     remainder = amount % 100000000
     man = remainder // 10000
+    
     result = ""
+    
     if eok > 0:
         result += f"{eok}억 "
+        
     if man > 0:
         result += f"{man:,}만"
+        
     return result.strip() + " 원"
 
 def get_pnu_code(address, key, domain):
@@ -82,8 +88,10 @@ def get_pnu_code(address, key, domain):
             "query": address, "type": "address", "category": "parcel",
             "format": "json", "key": key, "domain": domain
         }
+        # URL은 http://api.vworld.kr/req/search 입니다.
         response = requests.get("http://api.vworld.kr/req/search", params=params, timeout=5)
         data = response.json()
+
         if data['response']['status'] == 'OK' and data['response']['result']['items']:
             pnu = data['response']['result']['items'][0]['id']
             return pnu
@@ -98,17 +106,22 @@ def get_latest_official_price(pnu, key, target_year="2024", url="https://api.vwo
         "format": "json", "numOfRows": "100", "domain": domain
     }
     headers = {'Referer': domain}
+    
     try:
         response = requests.get(url, params=params, headers=headers, timeout=10)
+        
         if response.status_code == 200:
             data = response.json()
+            
             if 'apartHousingPrices' in data and 'field' in data['apartHousingPrices']:
                 items = data['apartHousingPrices']['field']
+                
                 if items:
                     latest_price = max([int(item.get('pblntfPc', 0)) for item in items])
                     area = items[0].get('prvuseAr', '0')
                     name = items[0].get('aphusNm', '주택명 미상')
                     return name, latest_price, float(area)
+            
         return "데이터 없음", 0, 0.0
     except Exception as e:
         return "통신 오류", 0, 0.0
@@ -118,12 +131,14 @@ def calculate_risk(official_price, market_price_ratio, jeonse_deposit, loan_amou
     estimated_market_price = int(official_price * market_price_ratio)
     total_burden = jeonse_deposit + loan_amount
     risk_percent = (total_burden / estimated_market_price) * 100 if estimated_market_price > 0 else 100.0
+
     if risk_percent < 70:
         judgment = "✅ 안전 (70% 미만)"
     elif risk_percent <= 80:
         judgment = "⚠️ 주의 (80% 이하 - 보증보험 필요)"
     else:
         judgment = "❌ 위험 (80% 초과 - 깡통전세 가능성 높음)"
+
     return risk_percent, judgment, estimated_market_price
 
 def calculate_safe_jeonse(estimated_market_price, loan_amount):
@@ -139,15 +154,25 @@ def calculate_safe_jeonse(estimated_market_price, loan_amount):
 # =========================================================
 
 def main():
-    st.set_page_config(layout="wide")
-    st.title("🛡️ 깡통전세 위험도 판독기 (공인중개사 버전)")
-
-    # --- 설정 파일 로드 및 유효성 검사 ---
+    # --- 설정 파일 로드 (가장 먼저 실행) ---
     VWORLD_KEY, MARKET_RATIO, ALLOWED_CODES = load_config()
-    if not VWORLD_KEY:
-        st.stop() # 키 로드 실패 시 앱 실행 중단
 
-    # --- 드롭다운 메뉴 필터링 ---
+    # --- Streamlit 페이지 설정 및 로고 적용 ---
+    st.set_page_config(
+        layout="wide",
+        page_title="깡통전세 위험도 판독기",
+        page_icon="logo.png" # ⬅️ 로고 파일명
+    )
+    st.title("🛡️ 깡통전세 위험도 판독기 (공인중개사 버전)")
+    st.sidebar.image("logo.png", width=100) # 사이드바 로고
+    st.sidebar.markdown("---")
+    
+    col_city, col_district, col_detail_input = st.columns(3)
+
+    # 1. 주소 입력 (담당 지역 필터링)
+    st.subheader("1. 담당 지역 및 주소 정보 입력")
+    
+    # --- 드롭다운 메뉴 필터링 로직 ---
     filtered_districts = {}
     for city, districts in FULL_ADMIN_DB.items():
         for district, code in districts.items():
@@ -157,27 +182,21 @@ def main():
                 filtered_districts[city].append(district)
 
     if not filtered_districts:
-        st.error("❌ 오류: 'config.ini'에 유효한 [LOCATION] 코드가 없습니다. 코드를 확인해 주세요.")
-        st.stop()
+        st.error("❌ 오류: 'config.ini'에 유효한 지역 코드가 없습니다. 관리자에게 문의하세요.")
+        return
 
-    # --- UI 구성 ---
-    st.markdown("---")
-    st.subheader("1. 담당 지역 및 주소 정보 입력")
-    
-    col_city, col_district, col_detail_input = st.columns(3)
-
-    # 1. 시/도 선택 (필터링된 리스트 사용)
+    # 1-1. 시/도 선택
     city_options = list(filtered_districts.keys())
     selected_city = col_city.selectbox("① 시/도 선택", city_options, index=0, key="city_select")
     
-    # 2. 시/군/구 선택 (필터링된 리스트 사용)
+    # 1-2. 시/군/구 선택 (Cascading Filter)
     district_options = filtered_districts.get(selected_city, [])
     selected_district = col_district.selectbox("② 시/군/구 선택", district_options, index=0, key="district_select")
 
-    # 3. 상세 주소 입력 (동, 번지)
+    # 1-3. 상세 주소 입력 (동, 번지)
     detail_address = col_detail_input.text_input(
         "③ 상세 주소 (동, 번지 예: 개포동 12)", 
-        value="개포동 12" if "강남구" in selected_district else "", 
+        value="개포동 12" if "강남구" in selected_district else "", # 강남구 선택 시 초기값 제공
         key="detail_addr_input",
         help="정확한 PNU 코드를 위해 반드시 '동 이름 + 번지' 포맷으로 입력해야 합니다."
     )
@@ -186,11 +205,17 @@ def main():
     TARGET_ADDRESS = f"{selected_city} {selected_district} {detail_address}"
     st.info(f"🔍 최종 검색 주소: {TARGET_ADDRESS}")
     
-    # ------------------ 전세 및 부채 정보 ------------------
+    # ------------------ 2. 전세 및 부채 정보 ------------------
     st.subheader("2. 전세 및 선순위 부채 정보")
     
-    JEONSE_DEPOSIT = st.number_input("목표 전세 보증금 (원)", min_value=0, value=1800000000, step=10000000, format="%i")
-    LOAN_AMOUNT = st.number_input("선순위 대출 금액 (원)", min_value=0, value=300000000, step=10000000, format="%i")
+    # ⚠️ 콤마 표시를 위해 format="%i" 적용
+    JEONSE_DEPOSIT = st.number_input(
+        "목표 전세 보증금 (원)", min_value=0, value=1800000000, step=10000000, format="%i"
+    )
+    
+    LOAN_AMOUNT = st.number_input(
+        "선순위 대출 금액 (원)", min_value=0, value=300000000, step=10000000, format="%i"
+    )
     
     st.markdown("---")
     
